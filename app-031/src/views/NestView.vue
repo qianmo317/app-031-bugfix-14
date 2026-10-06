@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob, runNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
+import { getJob, runNest, applyDrop, registerOffcuts, useStore } from '../lib/store'
 import { toast } from '../lib/ui'
 import { printJob } from '../lib/print'
 import { pct, money } from '../lib/format'
@@ -29,13 +29,20 @@ const cabinets = computed(() => {
   return [...set].sort()
 })
 
-// 已登记余料：以 (项目, 板, 尺寸) 判重
+// 已登记余料：以 (项目, 板, 位置, 尺寸) 判重。微调后余料位置/尺寸会变，
+// 必须按调后的位置重新登记，不能沿用调前那块。
 const { state } = useStore()
 function registered(si: number, o: { x: number; y: number; wMm: number; hMm: number }): boolean {
   const j = job.value
   if (!j) return false
   return state.offcuts.some(
-    (x) => x.jobId === j.id && x.sheetIndex === si && x.wMm === o.wMm && x.hMm === o.hMm
+    (x) =>
+      x.jobId === j.id &&
+      x.sheetIndex === si &&
+      (x.xMm ?? 0) === o.x &&
+      (x.yMm ?? 0) === o.y &&
+      x.wMm === o.wMm &&
+      x.hMm === o.hMm
   )
 }
 
@@ -74,44 +81,21 @@ function rerun(): void {
 function onDrop(payload: { instanceId: string; xMm: number; yMm: number }): void {
   if (!job.value?.result || !sheet.value) return
   const si = sheet.value.index
-  const placements = sheet.value.placements.map((p) => ({ ...p }))
-  const moved = placements.find((p) => p.instanceId === payload.instanceId)
-  if (!moved) return
-  const TOL = 0.5
-  const target = sheet.value.placements.find(
-    (p) =>
-      p.instanceId !== payload.instanceId &&
-      payload.xMm >= p.x - TOL &&
-      payload.yMm >= p.y - TOL &&
-      payload.xMm <= p.x + p.lenMm + TOL &&
-      payload.yMm <= p.y + p.widMm + TOL
-  )
-  const oc = sheet.value.offcuts.find(
-    (o) =>
-      payload.xMm >= o.x - TOL &&
-      payload.yMm >= o.y - TOL &&
-      payload.xMm <= o.x + o.wMm + TOL &&
-      payload.yMm <= o.y + o.hMm + TOL
-  )
-  if (target) {
-    const other = placements.find((p) => p.instanceId === target.instanceId)!
-    const ax = moved.x
-    const ay = moved.y
-    moved.x = other.x
-    moved.y = other.y
-    other.x = ax
-    other.y = ay
-  } else if (oc) {
-    moved.x = oc.x
-    moved.y = oc.y
+  // 落点坐标按毫米取整（拖放只解释整数毫米位置；刀路坐标内部保留 1 位小数）
+  const drop = {
+    instanceId: payload.instanceId,
+    xMm: Math.round(payload.xMm),
+    yMm: Math.round(payload.yMm)
   }
   const t0 = performance.now()
-  const err = applyAdjustment(job.value, si, placements)
+  // 前置判定（落点位置、交换/余料槽位尺寸）+ 落板（guillotine、逐刀模拟刀路、
+  // 余料/利用率/微调标记重算）全部在 store 内同一事务完成，失败不写回。
+  const err = applyDrop(job.value, si, drop)
   const ms = performance.now() - t0
   if (err) adjustFail(`${err}（校验耗时 ${ms.toFixed(1)}ms，已撤销）`)
   else {
-    toast(`微调生效，已重算刀路（增量校验 ${ms.toFixed(1)}ms）`, 'good')
-    selectedId.value = moved.instanceId
+    toast(`微调生效，刀路已逐刀模拟验证（${ms.toFixed(1)}ms），余料与利用率已同步刷新`, 'good')
+    selectedId.value = drop.instanceId
   }
 }
 function adjustFail(msg: string): void {
@@ -193,8 +177,9 @@ function printNest(): void {
           />
         </div>
         <p v-if="adjustMode" class="small muted">
-          拖动零件到虚线余料矩形内可移位；拖到另一零件上可交换（要求互相放得下）。
-          每次松手都会重新做 guillotine 合法性校验，非贯通排法会被拒绝并撤销。
+          拖动零件到虚线余料框内可移位；拖到另一件零件上可交换（两件就位尺寸必须互相装得下）。
+          松手先判落点与槽位尺寸，再枚举贯通刀路并逐刀模拟，只有能精确还原每件零件、
+          面积守恒的方案才会生效；装不下或落点不对会直接说明原因并撤销。
         </p>
 
         <div class="row wrap" style="margin-top: 10px">

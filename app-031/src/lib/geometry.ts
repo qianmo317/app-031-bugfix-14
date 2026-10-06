@@ -247,7 +247,7 @@ export function mergeSegs(raw: RawSeg[], kerf: number): MergedSeg[] {
   for (const s of raw) {
     let target: MergedSeg | undefined
     for (const g of groups) {
-      if (g.axis === s.axis && Math.abs(g.at - s.at) < 0.02) {
+      if (g.axis === s.axis && Math.abs(g.at - s.at) < 0.005) {
         const gap = Math.max(g.lo, s.lo) - Math.min(g.hi, s.hi)
         if (gap <= kerf + 0.6) {
           target = g

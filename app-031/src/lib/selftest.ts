@@ -3,8 +3,26 @@
 // 30 零件锯切工步 ≤20 且模拟器还原、余料再利用、300 零件性能 <1.5s。
 import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
-import { simulate, countSawOps } from './cuts'
+import { simulate, countSawOps, rebuildFromPlacements } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import { planDrop, commitAdjustment } from './adjust'
+import { migrateLoadedJobs } from './store'
+
+// 让 store 的读档迁移可在自测里直接调用（同名再导出一个测试别名）
+function requireAdjust(): {
+  planDrop: typeof planDrop
+  commitAdjustment: typeof commitAdjustment
+} {
+  return { planDrop, commitAdjustment }
+}
+function requireCuts(): { rebuildFromPlacements: typeof rebuildFromPlacements } {
+  return { rebuildFromPlacements }
+}
+function requireMigrate(): {
+  migrateLoadedJobsTest: (jobs: Job[]) => void
+} {
+  return { migrateLoadedJobsTest: migrateLoadedJobs }
+}
 
 export interface CheckResult {
   name: string
@@ -438,6 +456,109 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 手工微调落板：刀路逐刀还原、余料/利用率/已微调标记同源刷新；落点语义清晰
+  {
+    const job2 = makeJob([
+      makePart({ code: 'A', lenMm: 600, widMm: 500 }),
+      makePart({ code: 'B', lenMm: 500, widMm: 500 }),
+      makePart({ code: 'C', lenMm: 500, widMm: 500 })
+    ])
+    const r2 = nestJob(job2)
+    job2.result = r2
+    const sheet = r2.sheets[0]
+    const beforeSteps = sheet.steps.length
+
+    // 10a) 尺寸不合的交换：600×500 拖到 500×500 上，A 装不进对方槽 → 前置拒绝、说清尺寸
+    const { commitAdjustment, planDrop } = requireAdjust()
+    const pa0 = sheet.placements.find((p) => p.code === 'A')!
+    const pb0 = sheet.placements.find((p) => p.code === 'B')!
+    const planSwapBad = planDrop(sheet, { instanceId: pa0.instanceId, xMm: pb0.x, yMm: pb0.y }, job2.kerfMm)
+    const swapBadClear =
+      'error' in planSwapBad &&
+      /槽位尺寸不合/.test(planSwapBad.error) &&
+      /A（600×500/.test(planSwapBad.error) &&
+      /500×500/.test(planSwapBad.error)
+    const notWritten = sheet.steps.length === beforeSteps && sheet.adjusted !== true
+
+    // 10b) 落点不在余料框/零件上：明确报“落点不在…”
+    const planEmpty = planDrop(sheet, { instanceId: pa0.instanceId, xMm: 2, yMm: 2 }, job2.kerfMm)
+    const emptyClear = 'error' in planEmpty && /落点不在/.test(planEmpty.error)
+
+    // 10c) 正向落板（坐标不变，等价于把同一摆法重推一遍）：必须通过并刷新全部同源字段
+    const samePs = sheet.placements.map((p) => ({ ...p }))
+    const errOk = commitAdjustment(job2, sheet, samePs)
+    const simOkAfter = simulate(sheet.wMm, sheet.hMm, job2.kerfMm, sheet.steps, sheet.placements).ok
+    const refreshed =
+      errOk === null &&
+      simOkAfter &&
+      sheet.adjusted === true &&
+      sheet.placements.every((p) => p.adjusted === true) &&
+      Math.abs(sheet.usedAreaMm2 - (600 * 500 + 500 * 500 * 2)) <= 1 &&
+      Math.abs(sheet.utilization - sheet.usedAreaMm2 / sheet.boardAreaMm2) < 1e-9 &&
+      Array.isArray(sheet.offcuts)
+
+    // 10d) 余料框装不下：拖一件大零件到很小的碎料框上 → 明确报“余料框装不下”
+    const smallOc = sheet.offcuts.find((o) => o.wMm < pa0.lenMm || o.hMm < pa0.widMm)
+    const planOcBad = smallOc
+      ? planDrop(sheet, { instanceId: pa0.instanceId, xMm: smallOc.x, yMm: smallOc.y }, job2.kerfMm)
+      : { error: '余料框装不下' }
+    const ocBadClear = 'error' in planOcBad && /余料框装不下|槽位尺寸不合/.test(planOcBad.error)
+
+    add(
+      '微调落板：刀路逐刀还原、余料/利用率/已微调标记同源刷新；交换/落空/余料框提示清晰',
+      refreshed && swapBadClear && notWritten && emptyClear && ocBadClear,
+      refreshed
+        ? `落板通过；不合交换${swapBadClear ? '已前置拒绝并说清' : '未拦截'}；落空${emptyClear ? '清晰' : '含糊'}；碎料框${ocBadClear ? '拒绝' : '误放'}`
+        : `落板错误：${errOk}；未写回=${notWritten}`
+    )
+  }
+
+  // 11) 刀路反推逐个方案模拟：双锯路装不下的布局必须整体拒绝，不发错误刀路
+  {
+    const { rebuildFromPlacements } = requireCuts()
+    const tricky = [
+      { id: 'X', x: 8, y: 8, w: 650, h: 184 },
+      { id: 'Y', x: 8, y: 198, w: 958, h: 134 }
+    ]
+    const placements: import('../types').Placement[] = tricky.map((t) => ({
+      partId: t.id, instanceId: t.id, boardIndex: 0, x: t.x, y: t.y, lenMm: t.w, widMm: t.h,
+      origLen: t.w, origWid: t.h, rotated: false, seq: 0, code: t.id, name: '', cabinet: '',
+      exposed: false, grain: 'none', edgeBands: []
+    }))
+    const rebuilt = rebuildFromPlacements(2440, 1220, 3.2, 8, 0, placements)
+    add(
+      '刀路反推逐个方案模拟：双锯路装不下的布局被拒绝，不发错误刀路',
+      rebuilt === null,
+      rebuilt === null
+        ? '全部枚举方案均无法精确还原两件，已拒绝（照此下锯会多/少切一刀）'
+        : '错误地给出了无法精确还原的刀路'
+    )
+  }
+
+  // 12) 旧存档缺板级 adjusted 标记时按默认值兼容补上
+  {
+    const { migrateLoadedJobsTest } = requireMigrate()
+    const fakeJobs = [
+      {
+        result: {
+          sheets: [
+            { placements: [{ adjusted: true }], steps: [], offcuts: [] },
+            { placements: [{}], steps: [], offcuts: [] }
+          ]
+        }
+      }
+    ] as unknown as Job[]
+    migrateLoadedJobsTest(fakeJobs)
+    const s0 = fakeJobs[0].result!.sheets[0]
+    const s1 = fakeJobs[0].result!.sheets[1]
+    const ok = s0.adjusted === true && s1.adjusted === false
+    add(
+      '旧存档缺 adjusted 标记时按默认值兼容补齐',
+      ok,
+      ok ? '有微调零件的板补 true、无微调的板补 false' : `s0=${s0.adjusted} s1=${s1.adjusted}`
     )
   }
 

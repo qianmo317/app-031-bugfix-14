@@ -1,5 +1,5 @@
 // 裁切步骤：修边刀、内部贯通刀的合并/排序，以及最关键的「按步骤模拟切割」验证
-import type { CutStep, Placement, SheetResult } from '../types'
+import type { CutStep, OffcutInfo, Placement, SheetResult } from '../types'
 import { orderSegs, type Rect, type RawSeg, EPS, type PlacedRect } from './geometry'
 
 export interface DSeg extends RawSeg {
@@ -21,7 +21,7 @@ function mergeDSegs(raw: DSeg[], kerf: number): GSeg[] {
   for (const s of raw) {
     let target: GSeg | undefined
     for (const g of groups) {
-      if (g.axis === s.axis && Math.abs(g.at - s.at) < 0.02) {
+      if (g.axis === s.axis && Math.abs(g.at - s.at) < 0.005) {
         const gap = Math.max(g.lo, s.lo) - Math.min(g.hi, s.hi)
         if (gap <= kerf + 0.6) {
           target = g
@@ -247,7 +247,7 @@ function stepsFromSegs(
       merged.push({ ...s })
       continue
     }
-    const g = merged.find((x) => x.axis === s.axis && Math.abs(x.at - s.at) < 0.02)
+    const g = merged.find((x) => x.axis === s.axis && Math.abs(x.at - s.at) < 0.005)
     if (g && Math.max(g.lo, s.lo) - Math.min(g.hi, s.hi) <= kerf + 0.6) {
       g.lo = Math.min(g.lo, s.lo)
       g.hi = Math.max(g.hi, s.hi)
@@ -271,15 +271,33 @@ function stepsFromSegs(
   ]
 }
 
-/** 手工微调路径：枚举 guillotine 分解，取排在最前的那一个方案。 */
-export function rebuildFromPlacements(
+/**
+ * 手工微调路径：枚举全部 guillotine 分解，逐个「生成刀路 → 逐刀模拟」，
+ * 取第一个能把每块零件精确还原的方案；合并刀与不合并刀都试（贪心合并在
+ * 少数摆法下会把隔着零件实体的短刀并成假贯通刀，此时退回不合并的短刀）。
+ * 绝不取未经模拟验证的第一个枚举方案：省掉的是毫秒级校验时间，代价是照刀路
+ * 下锯多切/少切一刀。
+ */
+export const REBUILD_BUDGET_MS = 300
+
+export interface RebuildOutcome {
+  steps: CutStep[]
+  leftovers: Rect[]
+}
+
+/**
+ * 枚举全部 guillotine 分解，逐个「生成刀路（先合并、再放弃合并）→ 逐刀模拟」，
+ * 返回第一个能精确还原每件零件的方案。
+ * status: ok 找到；unsolvable 枚举完所有方案都无法还原；timeout 超出校验预算。
+ */
+export function rebuildFromPlacementsChecked(
   w: number,
   h: number,
   kerf: number,
   trim: number,
   boardIndex: number,
   placements: Placement[]
-): { steps: CutStep[]; leftovers: Rect[] } | null {
+): { status: 'ok'; value: RebuildOutcome } | { status: 'unsolvable' } | { status: 'timeout' } {
   const rects: PlacedRect[] = placements.map((p) => ({
     id: p.instanceId,
     x: p.x,
@@ -288,14 +306,40 @@ export function rebuildFromPlacements(
     h: p.widMm
   }))
   const bounds: Rect = { x: trim, y: trim, w: w - 2 * trim, h: h - 2 * trim }
+  const deadline = performance.now() + REBUILD_BUDGET_MS
+  let tried = 0
   for (const dec of enumerateGuillotine(rects, bounds, kerf)) {
-    const steps = stepsFromSegs(dec.segs, w, h, kerf, trim, boardIndex, true)
-    return { steps, leftovers: dec.leftovers }
+    if (tried++ > 0 && performance.now() > deadline) return { status: 'timeout' }
+    for (const doMerge of [true, false] as const) {
+      const steps = stepsFromSegs(dec.segs, w, h, kerf, trim, boardIndex, doMerge)
+      const sim = simulate(w, h, kerf, steps, placements)
+      if (sim.ok) return { status: 'ok', value: { steps, leftovers: dec.leftovers } }
+    }
   }
-  return null
+  return { status: 'unsolvable' }
 }
 
-/** 逐刀模拟：维护当前矩形集合，每步按锯路居中劈开相交矩形，最后核对零件尺寸。 */
+/** 兼容旧签名：只取刀路，失败（无解或超时）统一返回 null。 */
+export function rebuildFromPlacements(
+  w: number,
+  h: number,
+  kerf: number,
+  trim: number,
+  boardIndex: number,
+  placements: Placement[]
+): RebuildOutcome | null {
+  const r = rebuildFromPlacementsChecked(w, h, kerf, trim, boardIndex, placements)
+  return r.status === 'ok' ? r.value : null
+}
+
+/**
+ * 逐刀模拟：维护当前矩形集合，每步按锯路居中劈开相交矩形，最后核对：
+ * 1) 每件零件都能在叶块中找到唯一一块位置/尺寸一致的料（容差 1mm，由刀位取整产生）；
+ * 2) 每个非零件叶块不切入任何零件；
+ * 3) 面积守恒：Σ叶块面积 + 锯路吃掉的面积 ≈ 原板面积（允许取整误差）。
+ */
+const MATCH_TOL = 1 // 刀位按 0.1mm 取整、展示按 mm 取整，匹配容差取 1mm
+
 export function simulate(
   w: number,
   h: number,
@@ -305,6 +349,7 @@ export function simulate(
 ): { ok: boolean; errors: string[]; leaves: Rect[] } {
   const errors: string[] = []
   let leaves: Rect[] = [{ x: 0, y: 0, w, h }]
+  let kerfArea = 0 // 每刀实际吃掉的锯路面积（只统计真正劈开的叶块）
   for (const st of steps) {
     const next: Rect[] = []
     for (const leaf of leaves) {
@@ -320,12 +365,15 @@ export function simulate(
         next.push(leaf)
         continue
       }
+      // 实际被劈开的贯通长度：刀区间与叶块的交集
+      const cutLen = Math.min(st.span[1], alongStart + alongSize) - Math.max(st.span[0], alongStart)
       if (st.axis === 'v') {
         const wl = st.at - kerf / 2 - leaf.x
         const wr = leaf.x + leaf.w - (st.at + kerf / 2)
         if (wl >= -EPS && wr >= -EPS) {
           next.push({ x: leaf.x, y: leaf.y, w: wl, h: leaf.h })
           next.push({ x: st.at + kerf / 2, y: leaf.y, w: wr, h: leaf.h })
+          kerfArea += Math.max(0, cutLen) * kerf
         } else {
           next.push(leaf)
         }
@@ -335,6 +383,7 @@ export function simulate(
         if (hb >= -EPS && ht >= -EPS) {
           next.push({ x: leaf.x, y: leaf.y, w: leaf.w, h: hb })
           next.push({ x: leaf.x, y: st.at + kerf / 2, w: leaf.w, h: ht })
+          kerfArea += Math.max(0, cutLen) * kerf
         } else {
           next.push(leaf)
         }
@@ -347,10 +396,10 @@ export function simulate(
     const match = leaves.find((lf) => {
       if (usedLeaves.has(lf)) return false
       return (
-        Math.abs(lf.x - p.x) <= kerf + 0.6 &&
-        Math.abs(lf.y - p.y) <= kerf + 0.6 &&
-        Math.abs(lf.x + lf.w - (p.x + p.lenMm)) <= kerf + 0.6 &&
-        Math.abs(lf.y + lf.h - (p.y + p.widMm)) <= kerf + 0.6
+        Math.abs(lf.x - p.x) <= MATCH_TOL &&
+        Math.abs(lf.y - p.y) <= MATCH_TOL &&
+        Math.abs(lf.x + lf.w - (p.x + p.lenMm)) <= MATCH_TOL &&
+        Math.abs(lf.y + lf.h - (p.y + p.widMm)) <= MATCH_TOL
       )
     })
     if (!match) {
@@ -381,7 +430,65 @@ export function simulate(
       }
     }
   }
+  // 面积守恒：所有叶块 + 锯路损耗必须还原回原板面积。
+  // 容差按刀数放宽：每刀坐标取整 ±0.1mm，贯通整板时面积误差 ≤0.1×边长。
+  const leafArea = leaves.reduce((a, lf) => a + lf.w * lf.h, 0)
+  const tol = steps.length * 0.1 * Math.max(w, h) + 1
+  if (Math.abs(leafArea + kerfArea - w * h) > tol) {
+    errors.push(
+      `面积不守恒：逐刀还原 ${Math.round(leafArea)}mm² + 锯路 ${Math.round(kerfArea)}mm² ≠ 原板 ${
+        w * h
+      }mm²`
+    )
+  }
   return { ok: errors.length === 0, errors, leaves }
+}
+
+// 导入类型（放在文件顶部 import 区之外，见文件头部统一导入）
+
+/**
+ * 从逐刀模拟的叶块统一反算可用余料（排样器与手工微调共用同一出口）：
+ * - 零件占用的叶块不算余料；贴板边的修边废料不算；
+ * - 锯路零头细条（短边 ≤2.5mm）丢弃；
+ * - 两边 ≥300mm 标为可用余料，其余仅留档；按面积降序。
+ * 坐标/尺寸按 mm 取整（内部坐标保留 1 位小数，仅用于刀路计算）。
+ */
+export function offcutsFromLeaves(
+  leaves: Rect[],
+  placements: Placement[],
+  w: number,
+  h: number
+): OffcutInfo[] {
+  const isPart = (lf: Rect): boolean =>
+    placements.some(
+      (p) =>
+        Math.abs(lf.x - p.x) <= MATCH_TOL &&
+        Math.abs(lf.y - p.y) <= MATCH_TOL &&
+        Math.abs(lf.x + lf.w - (p.x + p.lenMm)) <= MATCH_TOL &&
+        Math.abs(lf.y + lf.h - (p.y + p.widMm)) <= MATCH_TOL
+    )
+  return leaves
+    .filter((lf) => {
+      if (lf.w < 2 - EPS || lf.h < 2 - EPS) return false
+      if (Math.min(lf.w, lf.h) <= 2.5) return false // 锯路零头
+      if (isPart(lf)) return false
+      const isTrimScrap =
+        lf.x <= EPS || lf.y <= EPS || lf.x + lf.w >= w - EPS || lf.y + lf.h >= h - EPS
+      return !isTrimScrap
+    })
+    .map((lf) => {
+      const wMm = Math.round(lf.w)
+      const hMm = Math.round(lf.h)
+      return {
+        x: Math.round(lf.x),
+        y: Math.round(lf.y),
+        wMm,
+        hMm,
+        areaMm2: wMm * hMm, // 面积按平方毫米整数计算（= 取整后的长×宽）
+        usable: lf.w >= 300 - EPS && lf.h >= 300 - EPS
+      }
+    })
+    .sort((a, c) => c.areaMm2 - a.areaMm2)
 }
 
 /** 车间实际锯切工步数：修边刀同规格板只算一次（叠切），内部刀按板计。 */

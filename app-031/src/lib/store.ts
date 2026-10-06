@@ -2,8 +2,7 @@
 import { reactive, computed } from 'vue'
 import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from '../types'
 import { nestJob } from './packing'
-import { rebuildFromPlacements } from './cuts'
-import { guillotineViolation } from './geometry'
+import { planDrop, commitAdjustment, type DropPoint } from './adjust'
 import { uid } from './format'
 import boardsData from '../data/boards.json'
 
@@ -43,6 +42,7 @@ function init(): void {
   if (state.loaded) return
   state.jobs = load<Job[]>(JOBS_KEY, [])
   state.offcuts = load<RegisteredOffcut[]>(OFFCUTS_KEY, [])
+  migrateLoadedJobs(state.jobs)
   state.loaded = true
 }
 
@@ -156,7 +156,23 @@ export function runNest(job: Job): NestResult {
   return result
 }
 
-/** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */
+/**
+ * 手工微调入口（排样结果页拖放专用）：先做落点/槽位前置判定，再落板重算。
+ * 返回 null = 生效；返回字符串 = 拒绝原因（未写回任何数据）。
+ */
+export function applyDrop(job: Job, sheetIndex: number, drop: DropPoint): string | null {
+  if (!job.result) return '尚未排样'
+  const sheet = job.result.sheets[sheetIndex]
+  if (!sheet) return '找不到该张板'
+  const planned = planDrop(sheet, drop, job.kerfMm)
+  if ('error' in planned) return planned.error
+  const err = commitAdjustment(job, sheet, planned.placements)
+  if (err) return err
+  persist()
+  return null
+}
+
+/** 仅供测试/编程式微调：直接给定摆法落板。 */
 export function applyAdjustment(
   job: Job,
   sheetIndex: number,
@@ -164,31 +180,29 @@ export function applyAdjustment(
 ): string | null {
   if (!job.result) return '尚未排样'
   const sheet = job.result.sheets[sheetIndex]
-  const bounds = {
-    x: job.trimMm,
-    y: job.trimMm,
-    w: sheet.wMm - 2 * job.trimMm,
-    h: sheet.hMm - 2 * job.trimMm
-  }
-  const violation = guillotineViolation(
-    placements.map((p) => ({ id: p.instanceId, x: p.x, y: p.y, w: p.lenMm, h: p.widMm })),
-    bounds,
-    job.kerfMm
-  )
-  if (violation) return violation
-  const rebuilt = rebuildFromPlacements(
-    sheet.wMm,
-    sheet.hMm,
-    job.kerfMm,
-    job.trimMm,
-    sheetIndex,
-    placements
-  )
-  if (!rebuilt) return '调整后无法生成可执行的贯通裁切刀路'
-  sheet.placements = placements.map((p) => ({ ...p, adjusted: true }))
-  sheet.steps = rebuilt.steps
+  if (!sheet) return '找不到该张板'
+  const err = commitAdjustment(job, sheet, placements)
+  if (err) return err
   persist()
   return null
+}
+
+/**
+ * 读档兼容：早先版本的手工微调结果只在零件上写了 adjusted，没有板级标记；
+ * 这里按默认值补齐（任一带 adjusted 标记的零件 ⇒ 该板 adjusted = true）。
+ * 缺失字段一律按默认值处理，不让旧存档读崩。
+ */
+export function migrateLoadedJobs(jobs: Job[]): void {
+  for (const job of jobs) {
+    if (!job.result) continue
+    for (const sheet of job.result.sheets) {
+      if (sheet.adjusted === undefined) {
+        sheet.adjusted = sheet.placements.some((p) => p.adjusted === true)
+      }
+      if (!Array.isArray(sheet.offcuts)) sheet.offcuts = []
+      if (!Array.isArray(sheet.steps)) sheet.steps = []
+    }
+  }
 }
 
 export function registerOffcuts(
@@ -204,6 +218,8 @@ export function registerOffcuts(
       jobId: job.id,
       jobName: job.name,
       sheetIndex: pick.sheetIndex,
+      xMm: pick.x,
+      yMm: pick.y,
       wMm: pick.wMm,
       hMm: pick.hMm,
       thicknessMm: sheet.thicknessMm,

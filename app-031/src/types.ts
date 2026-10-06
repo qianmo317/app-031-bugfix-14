@@ -130,6 +130,8 @@ export interface RegisteredOffcut {
   jobId: string
   jobName: string
   sheetIndex: number
+  xMm?: number // 余料在原板上的位置（mm，板左下角原点）；旧存档可能缺，缺省按 0 兼容
+  yMm?: number
   wMm: number
   hMm: number
   thicknessMm: number

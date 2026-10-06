@@ -6,14 +6,13 @@ import type {
   Board,
   Job,
   NestResult,
-  OffcutInfo,
   Part,
   Placement,
   SheetResult,
   UnplacedInfo
 } from '../types'
 import { EPS, type Rect } from './geometry'
-import { buildSteps, simulate } from './cuts'
+import { buildSteps, simulate, offcutsFromLeaves } from './cuts'
 import type { DSeg } from './cuts'
 
 interface Inst {
@@ -431,18 +430,12 @@ function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
   const boardArea = b.wMm * b.hMm
   const usedArea = s.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
 
-  // 剩余空档全部留档；两边 ≥300mm 才标记为可用余料，按面积降序
-  const offcuts: OffcutInfo[] = s.free
-    .filter((f) => f.w >= 2 && f.h >= 2)
-    .map((f) => ({
-      x: Math.round(f.x),
-      y: Math.round(f.y),
-      wMm: Math.round(f.w),
-      hMm: Math.round(f.h),
-      areaMm2: Math.round(f.w * f.h),
-      usable: f.w >= 300 - EPS && f.h >= 300 - EPS
-    }))
-    .sort((a, c) => c.areaMm2 - a.areaMm2)
+  // 余料一律由逐刀模拟的叶块反算（与手工微调共用同一出口，保证同一份几何）
+  const sim = simulate(b.wMm, b.hMm, kerf, steps, s.placements)
+  if (!sim.ok) {
+    console.error(`[排样] 第 ${s.index + 1} 张板切割模拟失败`, sim.errors)
+  }
+  const offcuts = offcutsFromLeaves(sim.leaves, s.placements, b.wMm, b.hMm)
 
   const sheet: SheetResult = {
     index: s.index,
@@ -459,10 +452,6 @@ function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
     boardAreaMm2: boardArea,
     utilization: usedArea / boardArea,
     offcuts
-  }
-  const sim = simulate(b.wMm, b.hMm, kerf, steps, s.placements)
-  if (!sim.ok) {
-    console.error(`[排样] 第 ${s.index + 1} 张板切割模拟失败`, sim.errors)
   }
   return sheet
 }

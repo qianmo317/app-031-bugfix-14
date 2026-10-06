@@ -1,5 +1,24 @@
 // 通用工具：ID、金额、面积格式化、文件下载、CSV 解析
 
+/**
+ * 尺寸/面积的单位与精度约定（全项目统一）：
+ * - 长度单位毫米（mm）。清单录入、拖放落点、界面展示一律按整数毫米（0 位小数）；
+ * - 刀路坐标（CutStep.at / span）内部保留 1 位小数（推台锯对刀精度 0.1mm），
+ *   打印与界面的刀位同样显示到 0.1mm，贯通区间按整数毫米；
+ * - 面积单位平方毫米（mm²），按整数计算（取整后的整数毫米边长相乘）；
+ *   换算平方米（m²）时保留 2 位小数；
+ * - 利用率为无量纲比值，界面按百分比保留 1 位小数；
+ * - 锯路/修边为毫米，锯路保留 1 位小数（如 3.2mm）。
+ */
+export const PRECISION = {
+  lengthMm: 0, // 展示尺寸：整数毫米
+  cutAtMm: 1, // 刀位：1 位小数
+  spanMm: 0, // 贯通区间：整数毫米
+  areaMm2: 0, // 面积：整数平方毫米
+  areaM2: 2, // 平方米：2 位小数
+  utilizationPct: 1 // 利用率百分比：1 位小数
+} as const
+
 export function uid(prefix = 'id'): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 }
