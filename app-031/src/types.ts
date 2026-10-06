@@ -130,6 +130,9 @@ export interface RegisteredOffcut {
   jobId: string
   jobName: string
   sheetIndex: number
+  /** 登记时余料在板上的位置（mm 整数）；板被重新排样/微调后按此判定登记是否失效。 */
+  x?: number
+  y?: number
   wMm: number
   hMm: number
   thicknessMm: number
@@ -137,4 +140,7 @@ export interface RegisteredOffcut {
   createdAt: number
   available: boolean
   usedByJobId?: string
+  /** true = 该板后来重排/微调，这块余料的位置尺寸已不存在，登记作废。 */
+  voided?: boolean
+  voidReason?: string
 }

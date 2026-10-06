@@ -13,7 +13,7 @@ import type {
   UnplacedInfo
 } from '../types'
 import { EPS, type Rect } from './geometry'
-import { buildSteps, simulate } from './cuts'
+import { buildSteps, simulate, offcutsFromLeaves, OFFCUT_MIN_MM } from './cuts'
 import type { DSeg } from './cuts'
 
 interface Inst {
@@ -431,18 +431,27 @@ function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
   const boardArea = b.wMm * b.hMm
   const usedArea = s.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
 
-  // 剩余空档全部留档；两边 ≥300mm 才标记为可用余料，按面积降序
-  const offcuts: OffcutInfo[] = s.free
-    .filter((f) => f.w >= 2 && f.h >= 2)
-    .map((f) => ({
-      x: Math.round(f.x),
-      y: Math.round(f.y),
-      wMm: Math.round(f.w),
-      hMm: Math.round(f.h),
-      areaMm2: Math.round(f.w * f.h),
-      usable: f.w >= 300 - EPS && f.h >= 300 - EPS
-    }))
-    .sort((a, c) => c.areaMm2 - a.areaMm2)
+  // 余料唯一来源：照着最终刀路逐刀模拟后剩下的内部料块。
+  // 这样排样结果页、裁切步骤页、余料登记入口拿到的永远是同一份位置与尺寸。
+  const sim = simulate(b.wMm, b.hMm, kerf, steps, s.placements, trim)
+  let offcuts: OffcutInfo[]
+  if (sim.ok) {
+    offcuts = offcutsFromLeaves(sim.leftovers)
+  } else {
+    // 兜底：模拟失败时不允许带错出单；保留空档留档并在控制台点名（正常不应发生）
+    console.error(`[排样] 第 ${s.index + 1} 张板切割模拟失败`, sim.errors)
+    offcuts = s.free
+      .filter((f) => f.w >= 2 && f.h >= 2)
+      .map((f) => ({
+        x: Math.round(f.x),
+        y: Math.round(f.y),
+        wMm: Math.round(f.w),
+        hMm: Math.round(f.h),
+        areaMm2: Math.round(f.w * f.h),
+        usable: f.w >= OFFCUT_MIN_MM - EPS && f.h >= OFFCUT_MIN_MM - EPS
+      }))
+      .sort((a, c) => c.areaMm2 - a.areaMm2)
+  }
 
   const sheet: SheetResult = {
     index: s.index,
@@ -459,10 +468,6 @@ function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
     boardAreaMm2: boardArea,
     utilization: usedArea / boardArea,
     offcuts
-  }
-  const sim = simulate(b.wMm, b.hMm, kerf, steps, s.placements)
-  if (!sim.ok) {
-    console.error(`[排样] 第 ${s.index + 1} 张板切割模拟失败`, sim.errors)
   }
   return sheet
 }

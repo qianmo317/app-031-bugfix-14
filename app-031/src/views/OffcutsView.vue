@@ -68,12 +68,16 @@ function del(id: string): void {
         <tbody>
           <tr v-for="o in sorted" :key="o.id" :class="{ used: !o.available }">
             <td>
-              <span :class="['tag', o.available ? 'good' : '']">{{ o.available ? '可优先使用' : '已用掉' }}</span>
+              <span v-if="o.voided" class="tag bad">已作废</span>
+              <span v-else :class="['tag', o.available ? 'good' : '']">{{ o.available ? '可优先使用' : '已用掉' }}</span>
             </td>
             <td><b>{{ o.wMm }}×{{ o.hMm }}</b></td>
             <td>{{ o.thicknessMm }}mm {{ o.material }}</td>
             <td>{{ (o.wMm * o.hMm / 1e6).toFixed(2) }}m²</td>
-            <td>{{ o.jobName }}（第 {{ o.sheetIndex + 1 }} 张）</td>
+            <td>
+              {{ o.jobName }}（第 {{ o.sheetIndex + 1 }} 张）
+              <div v-if="o.voidReason" class="small muted">{{ o.voidReason }}</div>
+            </td>
             <td>{{ new Date(o.createdAt).toLocaleDateString('zh-CN') }}</td>
             <td>
               <button class="sm" @click="toggleOffcut(o.id)">{{ o.available ? '标记已用' : '恢复可用' }}</button>

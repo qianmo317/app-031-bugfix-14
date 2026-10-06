@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { getJob, runNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
+import { planDrop, applySwapOrientations } from '../lib/adjust'
 import { toast } from '../lib/ui'
 import { printJob } from '../lib/print'
 import { pct, money } from '../lib/format'
@@ -29,13 +30,20 @@ const cabinets = computed(() => {
   return [...set].sort()
 })
 
-// 已登记余料：以 (项目, 板, 尺寸) 判重
+// 已登记余料：以 (项目, 板, 位置, 尺寸) 判重
 const { state } = useStore()
 function registered(si: number, o: { x: number; y: number; wMm: number; hMm: number }): boolean {
   const j = job.value
   if (!j) return false
   return state.offcuts.some(
-    (x) => x.jobId === j.id && x.sheetIndex === si && x.wMm === o.wMm && x.hMm === o.hMm
+    (x) =>
+      x.jobId === j.id &&
+      x.sheetIndex === si &&
+      x.available &&
+      x.x === o.x &&
+      x.y === o.y &&
+      x.wMm === o.wMm &&
+      x.hMm === o.hMm
   )
 }
 
@@ -68,54 +76,61 @@ function rerun(): void {
   if (!job.value) return
   runNest(job.value)
   activeSheet.value = 0
-  toast('已重新排样', 'good')
+  selectedId.value = null
+  toast('已重新排样；此前登记的本单余料位置已失效并自动作废', 'good')
 }
 
 function onDrop(payload: { instanceId: string; xMm: number; yMm: number }): void {
-  if (!job.value?.result || !sheet.value) return
-  const si = sheet.value.index
-  const placements = sheet.value.placements.map((p) => ({ ...p }))
+  const j = job.value
+  const sh = sheet.value
+  if (!j?.result || !sh) return
+  const si = sh.index
+
+  // 第一步：落点与槽位预判——先把放不放得下说清楚，再谈刀路
+  const plan = planDrop(sh, payload.instanceId, payload.xMm, payload.yMm, j.kerfMm)
+  if (plan.kind === 'reject') {
+    adjustFail(plan.message)
+    return
+  }
+  if (plan.kind === 'noop') return
+
+  // 第二步：在候选摆法上写坐标/朝向（尚未提交，失败即丢弃，界面因 props 不变而自动还原）
+  const placements = sh.placements.map((p) => ({ ...p }))
   const moved = placements.find((p) => p.instanceId === payload.instanceId)
   if (!moved) return
-  const TOL = 0.5
-  const target = sheet.value.placements.find(
-    (p) =>
-      p.instanceId !== payload.instanceId &&
-      payload.xMm >= p.x - TOL &&
-      payload.yMm >= p.y - TOL &&
-      payload.xMm <= p.x + p.lenMm + TOL &&
-      payload.yMm <= p.y + p.widMm + TOL
-  )
-  const oc = sheet.value.offcuts.find(
-    (o) =>
-      payload.xMm >= o.x - TOL &&
-      payload.yMm >= o.y - TOL &&
-      payload.xMm <= o.x + o.wMm + TOL &&
-      payload.yMm <= o.y + o.hMm + TOL
-  )
-  if (target) {
-    const other = placements.find((p) => p.instanceId === target.instanceId)!
+  if (plan.kind === 'swap') {
+    const other = placements.find((p) => p.instanceId === plan.targetId)!
     const ax = moved.x
     const ay = moved.y
     moved.x = other.x
     moved.y = other.y
     other.x = ax
     other.y = ay
-  } else if (oc) {
-    moved.x = oc.x
-    moved.y = oc.y
+    applySwapOrientations(placements, moved.instanceId, plan)
+  } else {
+    moved.x = plan.offcut.x
+    moved.y = plan.offcut.y
+    // 移位不允许转（落点是矩形框，不是另一件）；恢复清单朝向，避免沿用历史 rotated
+    moved.lenMm = moved.origLen
+    moved.widMm = moved.origWid
+    moved.rotated = false
   }
+
+  // 第三步：guillotine 合法性 + 逐个方案模拟刀路，全部通过才原子写回
   const t0 = performance.now()
-  const err = applyAdjustment(job.value, si, placements)
+  const res = applyAdjustment(j, si, placements)
   const ms = performance.now() - t0
-  if (err) adjustFail(`${err}（校验耗时 ${ms.toFixed(1)}ms，已撤销）`)
-  else {
-    toast(`微调生效，已重算刀路（增量校验 ${ms.toFixed(1)}ms）`, 'good')
-    selectedId.value = moved.instanceId
+  if (!res.ok) {
+    adjustFail(`${res.error}（校验耗时 ${ms.toFixed(1)}ms，已撤销）`)
+    return
   }
+  selectedId.value = moved.instanceId
+  const tail: string[] = [`增量校验 ${ms.toFixed(1)}ms`, `本板利用率 ${pct(res.utilization)}`]
+  if (res.voidedCount > 0) tail.push(`已作废 ${res.voidedCount} 块旧位置的余料登记`)
+  toast(`微调生效：刀路、余料与利用率已按新摆法整体重算（${tail.join('，')}）`, 'good', 4200)
 }
 function adjustFail(msg: string): void {
-  toast(msg, 'bad', 3800)
+  toast(msg, 'bad', 4200)
 }
 
 const selected = computed(() =>
@@ -193,8 +208,11 @@ function printNest(): void {
           />
         </div>
         <p v-if="adjustMode" class="small muted">
-          拖动零件到虚线余料矩形内可移位；拖到另一零件上可交换（要求互相放得下）。
-          每次松手都会重新做 guillotine 合法性校验，非贯通排法会被拒绝并撤销。
+          拖动零件到虚线余料矩形内可移位；拖到另一件零件上可交换。松手先判槽位：
+          交换要求两件在对方位置上都放得下（纹理件不旋转），余料框必须装得下拖动件，
+          不合会指明差在哪个方向；落点不在余料框内会直接提示。
+          随后逐个模拟候选刀路，只有照刀路逐刀还原、每块尺寸都精确一致时才生效；
+          生效后本板刀路、余料位置尺寸与利用率整体重算，旧位置的余料登记自动作废。
         </p>
 
         <div class="row wrap" style="margin-top: 10px">
@@ -229,7 +247,7 @@ function printNest(): void {
           :key="i"
           class="oc-row"
         >
-          <span>{{ o.wMm }}×{{ o.hMm }}mm · {{ (o.areaMm2 / 1e6).toFixed(2) }}m²</span>
+          <span>{{ o.wMm }}×{{ o.hMm }}mm · {{ (o.areaMm2 / 1e6).toFixed(2) }}m² · 位 ({{ o.x }}, {{ o.y }})</span>
           <span v-if="registered(sheet!.index, o)" class="tag good">已登记</span>
         </div>
         <button class="sm" style="margin-top: 8px" @click="registerSheet(sheet!.index)">

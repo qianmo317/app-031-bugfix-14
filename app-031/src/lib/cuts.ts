@@ -1,6 +1,24 @@
 // 裁切步骤：修边刀、内部贯通刀的合并/排序，以及最关键的「按步骤模拟切割」验证
-import type { CutStep, Placement, SheetResult } from '../types'
+//
+// 精度与单位约定（全应用唯一口径）：
+// - 长度（位置/尺寸/锯路/修边/切割线坐标/贯通区间）：毫米（mm），展示与登记取整到 1mm
+//   （内部坐标可带 0.1mm 级锯路半宽：如 1.6mm；写入 CutStep.at 时四舍五入到 0.1mm）。
+// - 面积：平方毫米（mm²）整数；换算平方米时保留 2 位小数；利用率为比值，展示保留 1 位百分数。
+// - 刀路必须保证：照着 steps 逐刀还原出的零件，与零件清单尺寸逐一精确匹配（容差 0.6mm，
+//   对应推台锯定位精度），且所有料块面积 + 锯路吃掉面积 = 原板面积（守恒容差 1mm²）。
+import type { CutStep, Placement, SheetResult, OffcutInfo } from '../types'
 import { orderSegs, type Rect, type RawSeg, EPS, type PlacedRect } from './geometry'
+
+/** 逐刀还原尺寸与目标的匹配容差（mm）：0.1mm 取整 + 推台锯定位误差余量。 */
+export const SIZE_TOL = 0.6
+/** 面积守恒容差（mm²）。 */
+export const AREA_TOL = 1
+/** 可用余料短边门槛（mm）。 */
+export const OFFCUT_MIN_MM = 300
+/** 反推刀路枚举上限（超出视为本摆法在预算内找不到刀路）。 */
+const ENUM_BUDGET = 300
+/** 反推刀路墙钟预算（ms）：规格要求微调增量校验 < 80ms，留足余量。 */
+const TIME_BUDGET_MS = 200
 
 export interface DSeg extends RawSeg {
   deps: DSeg[]
@@ -127,8 +145,11 @@ export function buildSteps(
 function* enumerateGuillotine(
   rects: PlacedRect[],
   bounds: Rect,
-  kerf: number
+  kerf: number,
+  budget: { left: number }
 ): Generator<{ segs: RawSeg[]; leftovers: Rect[] }> {
+  if (budget.left <= 0) return
+  budget.left--
   if (rects.length === 0) {
     yield { segs: [], leftovers: bounds.w >= 2 && bounds.h >= 2 ? [bounds] : [] }
     return
@@ -208,8 +229,8 @@ function* enumerateGuillotine(
       cut.axis === 'v'
         ? { axis: 'v', at: cut.at, lo: bounds.y, hi: bounds.y + bounds.h }
         : { axis: 'h', at: cut.at, lo: bounds.x, hi: bounds.x + bounds.w }
-    for (const decL of enumerateGuillotine(ls, leftBound, kerf)) {
-      for (const decR of enumerateGuillotine(rs, rightBound, kerf)) {
+    for (const decL of enumerateGuillotine(ls, leftBound, kerf, budget)) {
+      for (const decR of enumerateGuillotine(rs, rightBound, kerf, budget)) {
         yield {
           segs: [seg, ...decL.segs, ...decR.segs],
           leftovers: [...decL.leftovers, ...decR.leftovers]
@@ -271,7 +292,59 @@ function stepsFromSegs(
   ]
 }
 
-/** 手工微调路径：枚举 guillotine 分解，取排在最前的那一个方案。 */
+/** 余料归类：修边废料（贴原板外沿）、锯路零头（短边 ≤2.5mm）、内部余料/碎料。 */
+export function classifyLeftovers(
+  leaves: Rect[],
+  w: number,
+  h: number,
+  trim: number
+): { leftovers: Rect[]; trimScrap: Rect[]; slivers: Rect[] } {
+  const leftovers: Rect[] = []
+  const trimScrap: Rect[] = []
+  const slivers: Rect[] = []
+  for (const lf of leaves) {
+    if (Math.min(lf.w, lf.h) <= 2.5) {
+      slivers.push(lf)
+      continue
+    }
+    const touchesOuter =
+      lf.x <= EPS || lf.y <= EPS || lf.x + lf.w >= w - EPS || lf.y + lf.h >= h - EPS
+    if (trim > 0 && touchesOuter) {
+      trimScrap.push(lf)
+    } else {
+      leftovers.push(lf)
+    }
+  }
+  return { leftovers, trimScrap, slivers }
+}
+
+/** 把模拟剩余料块转成余料登记信息（短边 ≥300mm 才标记为可用）。 */
+export function offcutsFromLeaves(leaves: Rect[]): OffcutInfo[] {
+  return leaves
+    .map((lf) => {
+      const wMm = Math.max(0, Math.round(lf.w))
+      const hMm = Math.max(0, Math.round(lf.h))
+      return {
+        x: Math.round(lf.x),
+        y: Math.round(lf.y),
+        wMm,
+        hMm,
+        areaMm2: Math.round(lf.w * lf.h),
+        usable: wMm >= OFFCUT_MIN_MM && hMm >= OFFCUT_MIN_MM
+      }
+    })
+    .sort((a, c) => c.areaMm2 - a.areaMm2)
+}
+
+/**
+ * 手工微调反推刀路（唯一安全策略：逐个方案模拟）。
+ *
+ * 枚举所有 guillotine 分解，对每个方案都照着刀路一刀一刀模拟，
+ * 直到找出第一个能把每块零件按清单尺寸精确还原、且面积守恒的方案才收。
+ * 取舍：不取「枚举到的第一个方案」——首方案可能多切/少切一刀（合并后贯通区间
+ * 越过零件，或某刀在局部料块上并不贯通），照它下锯会切错尺寸；逐个模拟多花
+ * 校验时间（预算 ENUM_BUDGET 个方案 / TIME_BUDGET_MS），保住的是刀路可用。
+ */
 export function rebuildFromPlacements(
   w: number,
   h: number,
@@ -279,7 +352,9 @@ export function rebuildFromPlacements(
   trim: number,
   boardIndex: number,
   placements: Placement[]
-): { steps: CutStep[]; leftovers: Rect[] } | null {
+):
+  | { ok: true; steps: CutStep[]; sim: SimResult }
+  | { ok: false; reason: string } {
   const rects: PlacedRect[] = placements.map((p) => ({
     id: p.instanceId,
     x: p.x,
@@ -288,23 +363,67 @@ export function rebuildFromPlacements(
     h: p.widMm
   }))
   const bounds: Rect = { x: trim, y: trim, w: w - 2 * trim, h: h - 2 * trim }
-  for (const dec of enumerateGuillotine(rects, bounds, kerf)) {
-    const steps = stepsFromSegs(dec.segs, w, h, kerf, trim, boardIndex, true)
-    return { steps, leftovers: dec.leftovers }
+  const budget = { left: ENUM_BUDGET }
+  const t0 = performance.now()
+  let enumerated = 0
+  let firstErr = ''
+  for (const dec of enumerateGuillotine(rects, bounds, kerf, budget)) {
+    enumerated++
+    // 先用「不合并」的逐段刀路：递归分解的每一段都在各自子料块上完整贯通，
+    // 合法分解在这一版必然能被逐刀还原。
+    const rawSteps = stepsFromSegs(dec.segs, w, h, kerf, trim, boardIndex, false)
+    const simRaw = simulate(w, h, kerf, rawSteps, placements, trim)
+    if (simRaw.ok) {
+      // 再试「同线合并」版以减少工步；合并后贯通区间可能越过别的料块（多切），
+      // 只有合并版同样逐刀还原才采用，否则宁可不合并（多几刀也不能切错）。
+      const mergedSteps = stepsFromSegs(dec.segs, w, h, kerf, trim, boardIndex, true)
+      const simMerged = simulate(w, h, kerf, mergedSteps, placements, trim)
+      if (simMerged.ok) return { ok: true, steps: mergedSteps, sim: simMerged }
+      return { ok: true, steps: rawSteps, sim: simRaw }
+    }
+    if (!firstErr) firstErr = simRaw.errors[0] ?? '刀路无法逐刀还原零件'
+    if (performance.now() - t0 > TIME_BUDGET_MS) break
   }
-  return null
+  if (enumerated === 0) {
+    return { ok: false, reason: '调整后的摆法不存在贯通（推台锯可加工）分解' }
+  }
+  if (budget.left <= 0 || performance.now() - t0 > TIME_BUDGET_MS) {
+    return {
+      ok: false,
+      reason: `候选刀路过多，在预算内（${ENUM_BUDGET} 个方案 / ${TIME_BUDGET_MS}ms）没找到能逐刀还原的刀路`
+    }
+  }
+  return { ok: false, reason: firstErr || '枚举到的刀路都无法把每块零件精确还原' }
 }
 
-/** 逐刀模拟：维护当前矩形集合，每步按锯路居中劈开相交矩形，最后核对零件尺寸。 */
+export interface SimResult {
+  ok: boolean
+  errors: string[]
+  leaves: Rect[]
+  /** 模拟结束后未归属零件的内部料块（余料/碎料）。 */
+  leftovers: Rect[]
+  /** 锯路吃掉的面积（mm²，按实际劈开的料块计）。 */
+  kerfAreaMm2: number
+}
+
+/**
+ * 逐刀模拟：维护当前矩形集合，每步按锯路居中劈开相交矩形，最后核对：
+ * 1) 每个零件都能在最终料块中找到一块尺寸/位置精确匹配的（容差 SIZE_TOL）；
+ * 2) 每一刀在它相交的每个料块上必须真正贯通（贯通区间覆盖料块全长），
+ *    覆盖不到就说明照此刀路会多切/少切，直接判错；
+ * 3) 面积守恒：Σ料块面积 + Σ锯路吃掉面积 = 原板面积（容差 AREA_TOL）。
+ */
 export function simulate(
   w: number,
   h: number,
   kerf: number,
   steps: CutStep[],
-  placements: Placement[]
-): { ok: boolean; errors: string[]; leaves: Rect[] } {
+  placements: Placement[],
+  trim = 0
+): SimResult {
   const errors: string[] = []
   let leaves: Rect[] = [{ x: 0, y: 0, w, h }]
+  let kerfArea = 0
   for (const st of steps) {
     const next: Rect[] = []
     for (const leaf of leaves) {
@@ -320,12 +439,26 @@ export function simulate(
         next.push(leaf)
         continue
       }
+      // 贯通校验：锯开料块时，贯通区间必须覆盖该料块沿刀方向的全长；
+      // 只盖住一截却按整宽劈开，等于多切了一刀，照做必错。
+      if (
+        st.span[0] > alongStart + SIZE_TOL ||
+        st.span[1] < alongStart + alongSize - SIZE_TOL
+      ) {
+        errors.push(
+          `第 ${st.order + 1} 刀（${st.axis === 'v' ? '竖切' : '横切'} ${Math.round(st.at)}mm）` +
+            `在 ${Math.round(leaf.w)}×${Math.round(leaf.h)} 料块上没有贯通，照此下锯会多切`
+        )
+        next.push(leaf)
+        continue
+      }
       if (st.axis === 'v') {
         const wl = st.at - kerf / 2 - leaf.x
         const wr = leaf.x + leaf.w - (st.at + kerf / 2)
         if (wl >= -EPS && wr >= -EPS) {
           next.push({ x: leaf.x, y: leaf.y, w: wl, h: leaf.h })
           next.push({ x: st.at + kerf / 2, y: leaf.y, w: wr, h: leaf.h })
+          kerfArea += kerf * leaf.h
         } else {
           next.push(leaf)
         }
@@ -335,6 +468,7 @@ export function simulate(
         if (hb >= -EPS && ht >= -EPS) {
           next.push({ x: leaf.x, y: leaf.y, w: leaf.w, h: hb })
           next.push({ x: leaf.x, y: st.at + kerf / 2, w: leaf.w, h: ht })
+          kerfArea += kerf * leaf.w
         } else {
           next.push(leaf)
         }
@@ -342,46 +476,50 @@ export function simulate(
     }
     leaves = next
   }
+
+  const leavesArea = leaves.reduce((a, lf) => a + lf.w * lf.h, 0)
+  if (Math.abs(leavesArea + kerfArea - w * h) > AREA_TOL) {
+    errors.push(
+      `面积不守恒：料块 ${Math.round(leavesArea)}mm² + 锯路 ${Math.round(kerfArea)}mm² ` +
+        `≠ 原板 ${w * h}mm²（差 ${Math.round(leavesArea + kerfArea - w * h)}mm²），有漏切或多切`
+    )
+  }
+
   const usedLeaves = new Set<Rect>()
   for (const p of placements) {
     const match = leaves.find((lf) => {
       if (usedLeaves.has(lf)) return false
       return (
-        Math.abs(lf.x - p.x) <= kerf + 0.6 &&
-        Math.abs(lf.y - p.y) <= kerf + 0.6 &&
-        Math.abs(lf.x + lf.w - (p.x + p.lenMm)) <= kerf + 0.6 &&
-        Math.abs(lf.y + lf.h - (p.y + p.widMm)) <= kerf + 0.6
+        Math.abs(lf.x - p.x) <= SIZE_TOL &&
+        Math.abs(lf.y - p.y) <= SIZE_TOL &&
+        Math.abs(lf.x + lf.w - (p.x + p.lenMm)) <= SIZE_TOL &&
+        Math.abs(lf.y + lf.h - (p.y + p.widMm)) <= SIZE_TOL
       )
     })
     if (!match) {
-      errors.push(`零件 ${p.code} 在切割模拟结果中找不到对应尺寸的矩形`)
+      errors.push(`零件 ${p.code} 在切割模拟结果中找不到对应尺寸的矩形（切出来的尺寸对不上）`)
     } else {
       usedLeaves.add(match)
     }
   }
-  for (const lf of leaves) {
-    if (usedLeaves.has(lf)) continue
-    // ≤2.5mm 的细条是锯路吃掉的零头，不是真实料块
-    if (Math.min(lf.w, lf.h) <= 2.5) continue
-    // 修边废料一定贴着原板外沿
-    const isTrimScrap =
-      lf.x <= EPS || lf.y <= EPS || lf.x + lf.w >= w - EPS || lf.y + lf.h >= h - EPS
-    if (!isTrimScrap) {
-      // 所有切线都源自零件边缘（+锯路），因此非零件叶只要不与任何零件重叠，
-      // 就是余料/碎料（可能被贯通刀进一步切碎，但不影响加工正确性）
-      const hitsPart = placements.some(
-        (p) =>
-          lf.x < p.x + p.lenMm - EPS &&
-          p.x < lf.x + lf.w - EPS &&
-          lf.y < p.y + p.widMm - EPS &&
-          p.y < lf.y + lf.h - EPS
-      )
-      if (hitsPart) {
-        errors.push(`模拟出现切入零件区域的矩形 ${Math.round(lf.w)}×${Math.round(lf.h)}`)
-      }
+
+  const freeLeaves = leaves.filter((lf) => !usedLeaves.has(lf))
+  const { leftovers } = classifyLeftovers(freeLeaves, w, h, trim)
+  for (const lf of leftovers) {
+    // 所有切线都源自零件边缘（+锯路），非零件叶只要不与任何零件重叠，
+    // 就是余料/碎料（可能被贯通刀进一步切碎，但不影响加工正确性）
+    const hitsPart = placements.some(
+      (p) =>
+        lf.x < p.x + p.lenMm - EPS &&
+        p.x < lf.x + lf.w - EPS &&
+        lf.y < p.y + p.widMm - EPS &&
+        p.y < lf.y + lf.h - EPS
+    )
+    if (hitsPart) {
+      errors.push(`模拟出现切入零件区域的矩形 ${Math.round(lf.w)}×${Math.round(lf.h)}`)
     }
   }
-  return { ok: errors.length === 0, errors, leaves }
+  return { ok: errors.length === 0, errors, leaves, leftovers, kerfAreaMm2: kerfArea }
 }
 
 /** 车间实际锯切工步数：修边刀同规格板只算一次（叠切），内部刀按板计。 */

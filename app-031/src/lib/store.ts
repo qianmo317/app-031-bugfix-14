@@ -2,7 +2,7 @@
 import { reactive, computed } from 'vue'
 import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from '../types'
 import { nestJob } from './packing'
-import { rebuildFromPlacements } from './cuts'
+import { rebuildFromPlacements, offcutsFromLeaves } from './cuts'
 import { guillotineViolation } from './geometry'
 import { uid } from './format'
 import boardsData from '../data/boards.json'
@@ -41,9 +41,31 @@ function persist(): void {
 
 function init(): void {
   if (state.loaded) return
-  state.jobs = load<Job[]>(JOBS_KEY, [])
+  state.jobs = migrateJobs(load<Job[]>(JOBS_KEY, []))
   state.offcuts = load<RegisteredOffcut[]>(OFFCUTS_KEY, [])
   state.loaded = true
+}
+
+/**
+ * 旧档兼容：早先存下来的手工微调结果没有「已微调」标记，读回来按默认值补上。
+ * 判定依据：摆法与该板刀路无法由排样器原始字段直接确认时成本太高，这里用保守规则——
+ * 只要板上存在带 adjusted 标记的零件，就把整板标记补为已微调；两者皆无时保持 false。
+ * 同时补齐余料登记缺失的可选字段（voided/x/y）。
+ */
+function migrateJobs(jobs: Job[]): Job[] {
+  for (const job of jobs) {
+    const sheets = job.result?.sheets
+    if (!sheets) continue
+    for (const sheet of sheets) {
+      if (sheet.adjusted === undefined) {
+        sheet.adjusted = sheet.placements.some((p) => p.adjusted === true)
+      }
+      for (const p of sheet.placements) {
+        if (p.adjusted === undefined) p.adjusted = false
+      }
+    }
+  }
+  return jobs
 }
 
 export function defaultBoards(): Board[] {
@@ -151,18 +173,70 @@ export function runNest(job: Job): NestResult {
       oc.usedByJobId = job.id
     }
   }
+  // 重新排样会整体替换本单所有板的摆法：此前登记、仍可用的余料位置尺寸不再成立，
+  // 一律作废（已用掉的保持「已用掉」）。
+  for (const oc of state.offcuts) {
+    if (oc.jobId === job.id && oc.available) {
+      oc.available = false
+      oc.voided = true
+      oc.voidReason = '该项目已重新排样，原余料位置已失效'
+    }
+  }
   job.result = result
   persist()
   return result
 }
 
-/** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */
+/** 作废旧登记：该板微调后，位置/尺寸对不上新摆法的仍可用登记余料。返回作废条数。 */
+function voidStaleOffcuts(
+  jobId: string,
+  sheetIndex: number,
+  current: { x: number; y: number; wMm: number; hMm: number }[],
+  reason: string
+): number {
+  let n = 0
+  for (const oc of state.offcuts) {
+    if (!(oc.jobId === jobId && oc.sheetIndex === sheetIndex && oc.available)) continue
+    const stillThere = current.some(
+      (o) => o.x === oc.x && o.y === oc.y && o.wMm === oc.wMm && o.hMm === oc.hMm
+    )
+    if (!stillThere) {
+      oc.available = false
+      oc.voided = true
+      oc.voidReason = reason
+      n++
+    }
+  }
+  return n
+}
+
+export interface AdjustOk {
+  ok: true
+  /** 因本次微调而作废的旧余料登记条数（位置尺寸已变）。 */
+  voidedCount: number
+  /** 微调后本板新的可用余料块数。 */
+  usableOffcuts: number
+  /** 重算后利用率。 */
+  utilization: number
+}
+
+export interface AdjustFail {
+  ok: false
+  error: string
+}
+
+/**
+ * 手工微调：移动/交换后重新校验 guillotine，并逐个模拟候选刀路，
+ * 只有能把每块零件按清单尺寸精确还原、面积守恒的刀路才写回。
+ * 写回是原子的：摆法、每步切割线、切出来的尺寸、余料位置尺寸、利用率、已微调标记
+ * 同一次全部更新；任何一步失败都保持原结果不动（页面上的拖动在调用方撤销）。
+ */
 export function applyAdjustment(
   job: Job,
   sheetIndex: number,
   placements: SheetResult['placements']
-): string | null {
-  if (!job.result) return '尚未排样'
+): AdjustOk | AdjustFail {
+  if (!job.result) return { ok: false, error: '尚未排样' }
   const sheet = job.result.sheets[sheetIndex]
   const bounds = {
     x: job.trimMm,
@@ -175,7 +249,8 @@ export function applyAdjustment(
     bounds,
     job.kerfMm
   )
-  if (violation) return violation
+  if (violation) return { ok: false, error: violation }
+
   const rebuilt = rebuildFromPlacements(
     sheet.wMm,
     sheet.hMm,
@@ -184,11 +259,38 @@ export function applyAdjustment(
     sheetIndex,
     placements
   )
-  if (!rebuilt) return '调整后无法生成可执行的贯通裁切刀路'
+  if (!rebuilt.ok) {
+    return { ok: false, error: rebuilt.reason }
+  }
+
+  // 余料唯一来源：照着新刀路逐刀模拟剩下的料块（与裁切步骤页同源）
+  const offcuts = offcutsFromLeaves(rebuilt.sim.leftovers)
+  const usedArea = placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
+  const currentUsable = offcuts
+    .filter((o) => o.usable)
+    .map((o) => ({ x: o.x, y: o.y, wMm: o.wMm, hMm: o.hMm }))
+  const voidedCount = voidStaleOffcuts(
+    job.id,
+    sheetIndex,
+    currentUsable,
+    '该板已手工微调，原登记余料的位置/尺寸已失效'
+  )
+
+  // 原子写回同一份数据
   sheet.placements = placements.map((p) => ({ ...p, adjusted: true }))
   sheet.steps = rebuilt.steps
+  sheet.offcuts = offcuts
+  sheet.usedAreaMm2 = usedArea
+  sheet.utilization = sheet.boardAreaMm2 > 0 ? usedArea / sheet.boardAreaMm2 : 0
+  sheet.adjusted = true
   persist()
-  return null
+
+  return {
+    ok: true,
+    voidedCount,
+    usableOffcuts: currentUsable.length,
+    utilization: sheet.utilization
+  }
 }
 
 export function registerOffcuts(
@@ -199,11 +301,25 @@ export function registerOffcuts(
   let n = 0
   for (const pick of picks) {
     const sheet = job.result.sheets[pick.sheetIndex]
+    // 同板同位置同尺寸不重复登记
+    const dup = state.offcuts.some(
+      (o) =>
+        o.jobId === job.id &&
+        o.sheetIndex === pick.sheetIndex &&
+        o.available &&
+        o.x === pick.x &&
+        o.y === pick.y &&
+        o.wMm === pick.wMm &&
+        o.hMm === pick.hMm
+    )
+    if (dup) continue
     state.offcuts.push({
       id: uid('oc'),
       jobId: job.id,
       jobName: job.name,
       sheetIndex: pick.sheetIndex,
+      x: pick.x,
+      y: pick.y,
       wMm: pick.wMm,
       hMm: pick.hMm,
       thicknessMm: sheet.thicknessMm,
@@ -248,7 +364,11 @@ export function toggleOffcut(id: string): void {
   const o = state.offcuts.find((x) => x.id === id)
   if (o) {
     o.available = !o.available
-    if (o.available) o.usedByJobId = undefined
+    if (o.available) {
+      o.usedByJobId = undefined
+      o.voided = false
+      o.voidReason = undefined
+    }
     persist()
   }
 }

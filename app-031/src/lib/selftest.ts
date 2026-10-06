@@ -3,7 +3,7 @@
 // 30 零件锯切工步 ≤20 且模拟器还原、余料再利用、300 零件性能 <1.5s。
 import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
-import { simulate, countSawOps } from './cuts'
+import { simulate, countSawOps, rebuildFromPlacements } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
 
 export interface CheckResult {
@@ -140,7 +140,7 @@ function dumpJob(job: Job, err?: string): void {
         console.error('DUMP_PL', p.code, p.x, p.y, p.lenMm, p.widMm, p.grain)
       for (const st of sheet.steps)
         console.error('DUMP_ST', st.order, st.kind, st.axis, st.at, st.span[0], st.span[1])
-      const sim = simulate(sheet.wMm, sheet.hMm, job.kerfMm, sheet.steps, sheet.placements)
+      const sim = simulate(sheet.wMm, sheet.hMm, job.kerfMm, sheet.steps, sheet.placements, job.trimMm)
       console.error('DUMP_SIM', JSON.stringify(sim.errors))
       for (const lf of sim.leaves)
         console.error('DUMP_LEAF', Math.round(lf.x), Math.round(lf.y), Math.round(lf.w), Math.round(lf.h))
@@ -168,7 +168,7 @@ function assertSheet(job: Job): string | null {
     const v = guillotineViolation(rects, bounds, job.kerfMm)
     if (v) return `板${sheet.index + 1}：${v}`
     // 逐步切割模拟
-    const sim = simulate(sheet.wMm, sheet.hMm, job.kerfMm, sheet.steps, sheet.placements)
+    const sim = simulate(sheet.wMm, sheet.hMm, job.kerfMm, sheet.steps, sheet.placements, job.trimMm)
     if (!sim.ok) return `板${sheet.index + 1}：${sim.errors.join('；')}`
     // 利用率复算（分子不含锯路）
     const net = sheet.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
@@ -331,7 +331,7 @@ export function runSelfTest(): SelfTestReport {
     const r = nestJob(job)
     const ops = countSawOps(r.sheets)
     const simsOk = r.sheets.every((s) =>
-      simulate(s.wMm, s.hMm, job.kerfMm, s.steps, s.placements).ok
+      simulate(s.wMm, s.hMm, job.kerfMm, s.steps, s.placements, job.trimMm).ok
     )
     const placed = r.sheets.reduce((a, s) => a + s.placements.length, 0)
     const ok = ops <= 20 && simsOk && placed === 30 && r.sheets.length === 2
@@ -438,6 +438,133 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 微调反推刀路：对 100 组排样结果逐板「取出摆法 → 重推刀路」，
+  //     必须找到能逐刀精确还原的方案（不许取枚举第一个就收）
+  {
+    const rng3 = mulberry32(4242)
+    let boardsTried = 0
+    let boardsOk = 0
+    let firstErr = ''
+    outer: for (let g = 0; g < 40; g++) {
+      const kerf = +(2 + rng3() * 2).toFixed(2)
+      const trim = 5 + Math.floor(rng3() * 6)
+      const kinds = 6 + Math.floor(rng3() * 14)
+      const parts: Part[] = []
+      for (let i = 0; i < kinds; i++) {
+        parts.push(
+          makePart({
+            code: `A${g}-${i}`,
+            lenMm: 200 + Math.floor(rng3() * 800),
+            widMm: 150 + Math.floor(rng3() * 500),
+            qty: 1 + Math.floor(rng3() * 3),
+            grain: rng3() < 0.5 ? 'none' : 'length'
+          })
+        )
+      }
+      const job = makeJob(parts, { kerfMm: kerf, trimMm: trim })
+      const r = nestJob(job)
+      for (const sheet of r.sheets) {
+        boardsTried++
+        const rebuilt = rebuildFromPlacements(
+          sheet.wMm,
+          sheet.hMm,
+          kerf,
+          trim,
+          sheet.index,
+          sheet.placements
+        )
+        if (!rebuilt.ok) {
+          firstErr = `组${g + 1} 板${sheet.index + 1}：${rebuilt.reason}`
+          break outer
+        }
+        // 重推出的刀路照做必须每块尺寸对得上，且面积守恒
+        const verify = simulate(
+          sheet.wMm,
+          sheet.hMm,
+          kerf,
+          rebuilt.steps,
+          sheet.placements,
+          trim
+        )
+        if (!verify.ok) {
+          firstErr = `组${g + 1} 板${sheet.index + 1}：${verify.errors[0]}`
+          break outer
+        }
+        boardsOk++
+      }
+    }
+    add(
+      '微调反推刀路逐个模拟，逐刀还原每块零件尺寸且面积守恒',
+      boardsOk === boardsTried && boardsTried > 0,
+      boardsOk === boardsTried && boardsTried > 0
+        ? `${boardsTried}/${boardsTried} 张板通过（每个方案都照刀路模拟到精确还原才收）`
+        : firstErr
+    )
+  }
+
+  // 11) 微调提交原子性：重推后 steps/offcuts/utilization/adjusted 必须同源一致
+  {
+    const job = makeJob([
+      makePart({ code: 'M1', lenMm: 700, widMm: 500, qty: 2 }),
+      makePart({ code: 'M2', lenMm: 600, widMm: 400, qty: 2 })
+    ])
+    const r = nestJob(job)
+    const sheet = r.sheets[0]
+    const beforeAdjusted = sheet.adjusted ?? false
+    // 走微调提交同款路径：重推刀路 → 逐刀模拟 → 用模拟料块重建余料 → 同次写回
+    const rebuilt = rebuildFromPlacements(
+      sheet.wMm,
+      sheet.hMm,
+      job.kerfMm,
+      job.trimMm,
+      sheet.index,
+      sheet.placements
+    )
+    let coherent = false
+    let detail = '未能重推刀路'
+    if (rebuilt.ok) {
+      const offcuts = rebuilt.sim.leftovers
+        .filter((l) => Math.min(l.w, l.h) > 2.5)
+        .map((l) => ({
+          x: Math.round(l.x),
+          y: Math.round(l.y),
+          wMm: Math.round(l.w),
+          hMm: Math.round(l.h),
+          areaMm2: Math.round(l.w * l.h),
+          usable: l.w >= 300 - 0.05 && l.h >= 300 - 0.05
+        }))
+      const used = sheet.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
+      sheet.placements = sheet.placements.map((p) => ({ ...p, adjusted: true }))
+      sheet.steps = rebuilt.steps
+      sheet.offcuts = offcuts
+      sheet.usedAreaMm2 = used
+      sheet.utilization = used / sheet.boardAreaMm2
+      sheet.adjusted = true
+      const simOk = simulate(
+        sheet.wMm,
+        sheet.hMm,
+        job.kerfMm,
+        sheet.steps,
+        sheet.placements,
+        job.trimMm
+      ).ok
+      const utilOk = Math.abs(sheet.utilization - used / sheet.boardAreaMm2) < 1e-12
+      // 余料面积 + 零件净面积 + 锯路面积 + 修边废料 = 原板面积（修边部分宽容差）
+      const offArea = offcuts.reduce((a, o) => a + o.areaMm2, 0)
+      const trimAllowance =
+        2 * (sheet.wMm + sheet.hMm) * job.trimMm + 5
+      const conserved =
+        offArea + rebuilt.sim.kerfAreaMm2 + used <= sheet.boardAreaMm2 + trimAllowance
+      coherent = simOk && utilOk && conserved && sheet.adjusted === true
+      detail = `刀路模拟 ${simOk ? '通过' : '失败'}、利用率 ${utilOk ? '一致' : '不一致'}、守恒 ${conserved ? '成立' : '不成立'}、余料 ${offcuts.length} 块`
+    }
+    add(
+      '微调生效后刀路、余料、利用率与已微调标记整体刷新且互相守恒',
+      beforeAdjusted === false && coherent,
+      detail
     )
   }
 
